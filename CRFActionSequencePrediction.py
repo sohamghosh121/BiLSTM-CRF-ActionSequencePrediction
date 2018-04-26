@@ -1,7 +1,10 @@
-# coding: utf-8
-import argparse
 
-# In[1]:
+import torch
+import torch.autograd as autograd
+import torch.nn as nn
+import torch.optim as optim
+import time
+from torch.autograd import Variable
 
 
 # Helpers
@@ -24,17 +27,9 @@ def log_sum_exp(vec):
     return max_score +         torch.log(torch.sum(torch.exp(vec - max_score_broadcast)))
 
 
-# In[38]:
-
 
 # adapted from http://pytorch.org/tutorials/beginner/nlp/advanced_tutorial.html
 
-import torch
-import torch.autograd as autograd
-import torch.nn as nn
-import torch.optim as optim
-import time
-from torch.autograd import Variable
 
 if torch.cuda.is_available():
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
@@ -49,23 +44,24 @@ class ActionRecognitionCRF(nn.Module):
         super(ActionRecognitionCRF, self).__init__()
         self.hidden_dim = hidden_dim
         self.predicate_set = predicate_set
-        self.objects_set = object_set
-        self.attributes_set = attribute_set
 
         # need to remove 0 index waale
         self.predicate_size = len(predicate_set)  + 2 # add start-stop
-        self.objects_size = len(object_set)  + 2
-        self.attributes_size = len(attribute_set)  + 2
+
+        self.use_lstm = args.use_lstm
+        self.use_crf = args.use_crf
 
         if args.use_lstm:
-            self.use_lstm = args.use_lstm
             self.action_lstm = nn.LSTM(input_dim, hidden_dim // 2,
                                 num_layers = 1, bidirectional=True) #
+            self.hidden2predicate = nn.Linear(hidden_dim, self.predicate_size)
+        else:
+            self.hidden2predicate = nn.Linear(input_dim, self.predicate_size)
 
         # self.hidden2predicate = nn.Linear(input_dim, self.predicate_size) # without LSTM
         # THIS BELOW WHEN USING LSTM
 
-        self.hidden2predicate = nn.Linear(hidden_dim, self.predicate_size)
+        
 
         if args.activation == 'relu':
             self.hidden2predicate_score = nn.ReLU()
@@ -76,9 +72,13 @@ class ActionRecognitionCRF(nn.Module):
         
 
         # action layer (detect actions first)
-        self.action_transitions = nn.Parameter(
-            torch.randn(self.predicate_size, self.predicate_size)
-            + args.diagonal_bias * torch.eye(self.predicate_size)) # initialise diagonals to a high value
+        if args.diagonal_bias != 0.0:
+            self.action_transitions = nn.Parameter(
+                torch.randn(self.predicate_size, self.predicate_size)
+                + args.diagonal_bias * torch.eye(self.predicate_size)) # initialise diagonals to a high value
+        else:
+            self.action_transitions = nn.Parameter(
+                torch.randn(self.predicate_size, self.predicate_size)) # initialise diagonals to a high value
 
         self.START_TAG_IX = self.predicate_size - 2
         self.STOP_TAG_IX = self.predicate_size - 1
@@ -177,7 +177,7 @@ class ActionRecognitionCRF(nn.Module):
         best_path.reverse()
         return path_score, best_path
 
-    def neg_log_likelihood(self, feats, tags):
+    def calculate_loss(self, feats, tags):
         feats = self._get_lstm_features(feats)
         if self.hidden2predicate_score is not None:
             feats = self.hidden2predicate_score(feats)
@@ -193,4 +193,48 @@ class ActionRecognitionCRF(nn.Module):
         # Find the best path, given the features.
         score, tag_seq = self._viterbi_decode(feats)
         return score, tag_seq
+
+
+class ActionRecognitionLSTM(nn.Module):
+    """
+        No CRF version
+        - if use_lstm is False, this is just doing frame classification
+    """
+    def __init__(self, input_dim, hidden_dim, predicate_set, args):
+        super(ActionRecognitionLSTM, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.predicate_set = predicate_set
+        self.predicate_size = len(predicate_set)  + 2 # add start-stop
+        self.use_lstm = args.use_lstm
+        if args.use_lstm:
+            self.action_lstm = nn.LSTM(input_dim, hidden_dim // 2,
+                                num_layers = 1, bidirectional=True) #
+            self.hidden2predicate = nn.Linear(hidden_dim, self.predicate_size)
+        else:
+            self.hidden2predicate = nn.Linear(input_dim, self.predicate_size)
+        self.loss = nn.CrossEntropyLoss()
+
+
+    def _get_lstm_features(self, video):
+        if self.use_lstm:
+            video = video.contiguous()
+            video = video.view(video.size()[0], 1, -1)
+            lstm_out, _ = self.action_lstm(video)
+            feats = self.hidden2predicate(lstm_out.view(video.size()[0], -1))
+        else:
+            feats = self.hidden2predicate(video)
+        return feats
+
+    def calculate_loss(self, feats, tags):
+        feats = self._get_lstm_features(feats) # SEQ_LEN x ACTION_SPACE
+        tags_var = Variable(torch.cuda.LongTensor(tags))
+        loss = self.loss(feats, tags_var)
+        return loss
+
+    def forward(self, video):
+        # Get the emission scores from the BiLSTM
+        feats = self._get_lstm_features(video)
+        _, idx = torch.max(feats, 1)
+        tag_seq = idx.data.cpu().numpy()
+        return None, tag_seq
 
