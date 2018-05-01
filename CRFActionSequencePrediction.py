@@ -44,9 +44,7 @@ class ActionRecognitionCRF(nn.Module):
         super(ActionRecognitionCRF, self).__init__()
         self.hidden_dim = hidden_dim
         self.predicate_set = predicate_set
-
-        # need to remove 0 index waale
-        self.predicate_size = len(predicate_set)  + 2 # add start-stop
+        self.predicate_size = len(predicate_set) + 2
 
         self.use_lstm = args.use_lstm
         self.use_crf = args.use_crf
@@ -61,30 +59,38 @@ class ActionRecognitionCRF(nn.Module):
         # self.hidden2predicate = nn.Linear(input_dim, self.predicate_size) # without LSTM
         # THIS BELOW WHEN USING LSTM
 
-        
-
         if args.activation == 'relu':
             self.hidden2predicate_score = nn.ReLU()
         elif args.activation == 'sigmoid':
             self.hidden2predicate_score = nn.Sigmoid()
+        elif args.activation == 'tanh':
+            self.hidden2predicate_score = nn.Tanh()
         else:
             self.hidden2predicate_score = None
         
 
+        if args.pretrained_model is not None:
+            pretrained_model_dict = torch.load(args.pretrained_model)['model']
+            self.load_state_dict(pretrained_model_dict)
+            for param, name in self.named_parameters():
+                if name in pretrained_model_dict: # if pretrained weights, don't screw it up
+                    param.requires_grad = False
+            
+
         # action layer (detect actions first)
-        if args.diagonal_bias != 0.0:
+        if args.transitions_init == 'randn': # initialise diagonals to a random-normal
             self.action_transitions = nn.Parameter(
-                torch.randn(self.predicate_size, self.predicate_size)
-                + args.diagonal_bias * torch.eye(self.predicate_size)) # initialise diagonals to a high value
-        else:
+                torch.randn(self.predicate_size, self.predicate_size))
+        else args.transitions_init == 'zeros':  # initialise diagonals to a zeros
             self.action_transitions = nn.Parameter(
-                torch.randn(self.predicate_size, self.predicate_size)) # initialise diagonals to a high value
+                torch.zeros(self.predicate_size, self.predicate_size))
 
         self.START_TAG_IX = self.predicate_size - 2
         self.STOP_TAG_IX = self.predicate_size - 1
 
         self.action_transitions.data[self.START_TAG_IX, :] = -10000
         self.action_transitions.data[:, self.STOP_TAG_IX] = -10000
+
 
     def _forward_alg(self, feats):
         # Do the forward algorithm to compute the partition function
@@ -96,7 +102,6 @@ class ActionRecognitionCRF(nn.Module):
         forward_var = autograd.Variable(init_alphas)
 
         # Iterate through the frames
-        feat_ix = 0
         for feat in feats:
             alphas_t = []  # The forward variables at this timestep
             for next_tag in range(self.predicate_size):
@@ -114,8 +119,6 @@ class ActionRecognitionCRF(nn.Module):
                 # scores.
                 alphas_t.append(log_sum_exp(next_tag_var))
             forward_var = torch.cat(alphas_t).view(1, -1)
-            feat_ix += 1
-
         terminal_var = forward_var + self.action_transitions[self.STOP_TAG_IX]
         alpha = log_sum_exp(terminal_var)
         return alpha
@@ -130,12 +133,12 @@ class ActionRecognitionCRF(nn.Module):
             feats = self.hidden2predicate(video)
         return feats
 
-    def _score_conversation(self, feats, tags):
+    def _score_action_seq(self, feats, tags):
         # Gives the score of a provided tag sequence
         score = autograd.Variable(torch.Tensor([0]))
-        last_tag = self.START_TAG_IX # exact point of change doesn't matter
+        tags = torch.cat([torch.cuda.LongTensor([self.START_TAG_IX]), torch.cuda.LongTensor(tags)])
         for i, feat in enumerate(feats):
-            score = score + self.action_transitions[tags[i], last_tag] + feat[tags[i]]
+            score = score + self.action_transitions[tags[i + 1], tags[i]] + feat[tags[i + 1]]
         score = score + self.action_transitions[self.STOP_TAG_IX, tags[-1]]
         return score
 
@@ -182,7 +185,7 @@ class ActionRecognitionCRF(nn.Module):
         if self.hidden2predicate_score is not None:
             feats = self.hidden2predicate_score(feats)
         forward_score = self._forward_alg(feats) # change to bilstm-crf later
-        gold_score = self._score_conversation(feats, tags)
+        gold_score = self._score_action_seq(feats, tags)
         return forward_score - gold_score
 
     def forward(self, video):  # dont confuse this with _forward_alg above.
@@ -193,6 +196,16 @@ class ActionRecognitionCRF(nn.Module):
         # Find the best path, given the features.
         score, tag_seq = self._viterbi_decode(feats)
         return score, tag_seq
+
+class ActionRecognitionCRFDiscriminative(ActionRecognitionCRF):
+
+    def calculate_loss(self, feats, tags):
+        feats = self._get_lstm_features(feats)
+        if self.hidden2predicate_score is not None:
+            feats = self.hidden2predicate_score(feats)
+        forward_score, path = self._viterbi_decode(feats)
+        gold_score = self._score_action_seq(feats, tags)
+        return forward_score - gold_score
 
 
 class ActionRecognitionLSTM(nn.Module):

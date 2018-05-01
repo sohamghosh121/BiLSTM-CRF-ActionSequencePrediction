@@ -1,4 +1,4 @@
-from CRFActionSequencePrediction import ActionRecognitionCRF, ActionRecognitionLSTM
+from CRFActionSequencePrediction import ActionRecognitionCRF, ActionRecognitionCRFDiscriminative, ActionRecognitionLSTM
 
 import argparse 
 import random
@@ -89,18 +89,24 @@ class BiLstmCRFTrainer:
             adaptive: %s or downsample freq: %d
             has LSTM: %s
             has CRF: %s
+            discr. CRF: %s
             activation: %s
             mean-pool features: %s
             diagonal-biasing: %s
+            loading pre-trained model: %s
+            freeze pre-trained: %s
         """ % (
             args.feature_name, 
             args.adaptive, 
             args.downsample_frequency, 
             args.use_lstm, 
             args.use_crf, 
+            args.use_disc_crf, 
             args.activation, 
             args.meanpool_features,
-            args.diagonal_bias)
+            args.diagonal_bias,
+            str(args.pretrained_model),
+            args.freeze_pretrained)
 
         print(readme)
 
@@ -118,11 +124,17 @@ class BiLstmCRFTrainer:
         self.epoch = 0
 
         if args.use_crf:
-            self.model = ActionRecognitionCRF(args.feature_size, args.hidden_sz, self.chosen_actions_ix, args)
+            if args.use_disc_crf:
+                self.model = ActionRecognitionCRFDiscriminative(args.feature_size, args.hidden_sz, self.chosen_actions_ix, args)
+            else:
+                self.model = ActionRecognitionCRF(args.feature_size, args.hidden_sz, self.chosen_actions_ix, args)
         else:
             self.model = ActionRecognitionLSTM(args.feature_size, args.hidden_sz, self.chosen_actions_ix, args)
 
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0001, weight_decay=1e-4)
+        if args.optim == 'adam':
+            self.optimizer = optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=1e-4)
+        elif args.optim == 'sgd':
+            self.optimizer = optim.SGD(self.model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=1e-4)
 
     def write_to_log(self, msg):
         if self.train:
@@ -178,18 +190,20 @@ class BiLstmCRFTrainer:
     def train_epoch(self, v_names):
         self.metrics = []
         self.losses = []
-        for v_name in v_names:
+        v_names_ = v_names.copy()
+        random.shuffle(v_names_)
+        for v_name in v_names_:
             inputs, targets = self.load_video(v_name)
-            self.do_train(inputs, targets)
+            self.get_loss(inputs, targets, train=True)
             self.get_predictions(v_name, inputs, targets)
             # self.write_to_log(str(e) + '\n')
             # print(e)
         self.summarize_metrics(self.metrics)
-        self.epoch += 1
         print('[TRAIN] Mean Loss', np.mean(self.losses))
+        self.write_to_log('[TRAIN] Mean Loss ' + str(np.mean(self.losses)) + '\n')
         # save model here
-        os.system('mkdir -p ' + self.EXP_FOLDER + '/models')
-        model_fname = self.EXP_FOLDER + '/models/model-' + str(self.epoch + 1)
+        os.system('mkdir -p exps/' + self.EXP_FOLDER + '/models')
+        model_fname = 'exps/' + self.EXP_FOLDER + '/models/model-' + str(self.epoch + 1)
         torch.save({
                 'model': self.model.state_dict(),
                 'optim': self.optimizer.state_dict()
@@ -198,24 +212,26 @@ class BiLstmCRFTrainer:
     def val_epoch(self, v_names):
         self.train = False
         self.metrics = []
-        self.path_scores = []
+        self.losses = []
         for v_name in v_names:
             try:
                 inputs, targets = self.load_video(v_name)
+                self.get_loss(inputs, targets, train=False)
                 self.get_predictions(v_name, inputs, targets)
             except Exception as e:
                 self.write_to_log(str(e) + ' \n')
                 print(e)
+        print('[VAL] Mean Loss ' + str(np.mean(self.losses)) + '\n')
         self.summarize_metrics(self.metrics)
         self.train = True
 
-    def do_train(self, inputs, targets):
+    def get_loss(self, inputs, targets, train=True):
         self.model.zero_grad()
         L = self.model.calculate_loss(inputs, targets)
-        L.backward()
         self.losses.append(L.data.cpu().numpy())
-        self.optimizer.step()
-
+        if train:
+            L.backward()
+            self.optimizer.step()
 
     def get_predictions(self, v_name, inputs, targets):
         _, pred_seq = self.model(inputs)
@@ -260,14 +276,6 @@ train_video_names = random.sample(video_names, int(0.8 * len(video_names)))
 val_video_names = [v for v in video_names if v not in train_video_names]
 
 
-"""
-    Experiments to run:
-        - Imagenet VGG features/Imagenet ResNet features
-        - with/without LSTM
-        - adaptive length 300/downsample by 5 (another experiment take videos 100 < l < 1000)
-            - do mean pooling?
-        - diagonal biasing
-"""
 
 
 if __name__ == '__main__':
@@ -278,7 +286,9 @@ if __name__ == '__main__':
     parser.add_argument('--adaptive-downsampling', dest='adaptive', type=bool, default=True)
 
     parser.add_argument('--use-lstm', dest='use_lstm', type=int, default=1)
+    parser.add_argument('--bilstm', dest='bilstm', type=int, default=1)
     parser.add_argument('--use-crf', dest='use_crf', type=int, default=1)
+    parser.add_argument('--use-disc-crf', dest='use_disc_crf', type=int, default=0)
 
     parser.add_argument('--hidden-sz', dest='hidden_sz', type=int, default=256)
     parser.add_argument('--activation', dest='activation', type=str, default='none')
@@ -293,18 +303,26 @@ if __name__ == '__main__':
     parser.add_argument('--min-length', dest='min_length', type=int, default=None)
     parser.add_argument('--max-length', dest='max_length', type=int, default=None)
 
-    parser.add_argument('--diagonal-bias', dest='diagonal_bias', type=float, default=0.0)
+    parser.add_argument('--transitions-init', dest='transitions_init', type=str, default='randn')
 
-    parser.add_argument('--nepochs', dest='nepochs', type=int, default=30)
+    parser.add_argument('--nepochs', dest='nepochs', type=int, default=50)
     parser.add_argument('--val_freq', dest='val_freq', type=int, default=5)
 
+    parser.add_argument('--optimizer', dest='optim', type=str, default='adam')
+    parser.add_argument('--lr', dest='lr', type=float, default=1e-4)
+    parser.add_argument('--momentum', dest='momentum', type=float, default=0.9) # only used in sgd
+
+    parser.add_argument('--pretrained-model', dest='pretrained_model', type=str, default=None)
+    parser.add_argument('--freeze-pretrained', dest='freeze_pretrained', type=int, default=1)
 
     args = parser.parse_args()
 
     trainer = BiLstmCRFTrainer(args)
 
+    trainer.val_epoch(val_video_names)
     for epoch in range(0, args.nepochs):
         trainer.train = True
         trainer.train_epoch(train_video_names)
         if (epoch + 1) % args.val_freq == 0:
             trainer.val_epoch(val_video_names)
+        trainer.epoch += 1
